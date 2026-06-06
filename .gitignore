@@ -1,0 +1,26 @@
+# Secrets
+.env
+server.conf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# Bot runtime (NapCat)
+NapCat.44498.Shell/
+
+# Local data (bindings, arcade counts — contains personal info)
+data/
+
+# Cache
+cache/
+
+# Test / debug files
+debug_qr_import.py
+test_run.py
+_font_*.png
+
+# Design reference
+design/
