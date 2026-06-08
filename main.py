@@ -42,6 +42,7 @@ from renderer import B50Renderer, FilteredScoreRenderer
 from store import bind_user, unbind_user, get_token
 
 api = MaimaiAPI()
+_at_events = set()  # 记录由 @bot 触发的群聊消息，用于无效命令回退
 
 
 # ══════════════════════════════════════════════════════
@@ -53,6 +54,36 @@ async def kano_prefix(event: Event):
     """群聊需 kano 前缀；私聊有无前缀均可"""
     if not isinstance(event, MessageEvent):
         return
+
+    # 群聊 @bot 优先处理 — 即使无文本也要响应
+    if isinstance(event, GroupMessageEvent):
+        bot_id = str(event.self_id)
+        segs = [(s.type, s.data) for s in event.message]
+        is_tome = event.is_tome()
+        logger.info(f"[@DEBUG] self_id={bot_id} is_tome={is_tome} segs={segs}")
+        if is_tome:
+            # 移除 @bot 的 at 段 或 CQ码文本
+            remaining = [
+                seg for seg in event.message
+                if not (seg.type == 'at' and str(seg.data.get('qq', '')) == bot_id)
+            ]
+            at_text = Message(remaining).extract_plain_text().strip()
+            # 也清除文本中的 CQ at 码残留
+            at_text = re.sub(r'\[CQ:at,qq=\d+\]', '', at_text).strip()
+            m = re.match(r'(?i:kano)\s*(.+)', at_text)
+            if m:
+                at_text = m.group(1)
+            if at_text:
+                # @bot + 唤醒类词（呢/在吗/活着吗等）→ 等同唤醒
+                if f'kano{at_text}' in _WAKE_WORDS:
+                    event.message = Message(MessageSegment.text(f'kano{at_text}'))
+                else:
+                    event.message = Message(MessageSegment.text(at_text))
+                    _at_events.add(id(event))
+            else:
+                event.message = Message(MessageSegment.text('kano呢'))
+            return
+
     text = event.get_plaintext().strip()
     if not text:
         return
@@ -1554,6 +1585,26 @@ wake_msg = on_message(rule=Rule(_wake_rule), priority=12, block=True)
 @wake_msg.handle()
 async def handle_wake(event: MessageEvent):
     await wake_msg.finish(MessageSegment.text(_WAKE_REPLY))
+
+
+# ══════════════════════════════════════════════════════
+# @bot 无效命令回退 — @bot + 无法匹配的内容
+# ══════════════════════════════════════════════════════
+
+def _at_fallback_rule(event: Event) -> bool:
+    if not isinstance(event, GroupMessageEvent):
+        return False
+    eid = id(event)
+    if eid in _at_events:
+        _at_events.discard(eid)
+        return True
+    return False
+
+_at_fallback = on_message(rule=Rule(_at_fallback_rule), priority=99, block=True)
+
+@_at_fallback.handle()
+async def handle_at_fallback():
+    await _at_fallback.finish(MessageSegment.text('不太对呢，试试给我发"help"吧'))
 
 
 # ══════════════════════════════════════════════════════
