@@ -31,6 +31,68 @@ from models import (
 )
 
 
+# ══════════════════════════════════════════════════════
+# 谱师别名映射 — 搜索任一别名自动展开双向匹配
+# ══════════════════════════════════════════════════════
+
+_CHARTER_ALIASES: dict[str, list[str]] = {
+    'はっぴー':    ['はっぴー', 'はっぴー星人', '緑風 犬三郎', 'はぴネコ(はっぴー',
+                   'はぴネコ)', 'はっぴー respects for 某S氏',
+                   'ﾚよ†ょ／∪ヽ"┠  (十', 'はっぴー vs からめる', '譜面-100号とはっぴー',
+                   'みんなでマイマイマー', '哈皮', 'happy', '哈批'],
+    'サファ太':    ['サファ太', 'さふぁた', 'Safari', '-ZONE- SaFaRi',
+                   'Safata.Hz', 'Safata.GHz', 'DANCE TIME(サファ太)',
+                   'Safazhel', 'safaTAmago', '沙发太'],
+    'Jack':       ['Jack', 'JAQ', 'R-blacX of JacQ', '"H"ack', '"H"ack underground',
+                   'jacK on Phoenix', 'チェシャ猫とハートのジャック', 'Hz-R.Arrow', '杰克'],
+    'シチミヘルツ': ['シチミヘルツ', '7.3Hz', '7.3GHz',
+                   '7.3GHz -Før The Legends-', 'SHICHIMI☆CAT', '7.3'],
+    'Phoenix':    ['Phoenix', '-ZONE-Phoenix', '-ZONE- Phoenix', 'red phoenix'],
+    'Luxizhel':   ['Luxizhel', 'BELiZHEL', 'LuxiHertz', 'Luxiいぬ', 'Safazhel',
+                   '沪溪河', '泸溪河'],
+    '小鳥遊さん':   ['小鳥遊さん', '小鳥遊チミ', '小鸟游'],
+    '翠楼屋':      ['翠楼屋', '作譜：翠楼屋', '翠翠', '翠', 'suirouya'],
+    '鳩ホルダー':   ['鳩ホルダー', '鳩サファzhel', '鳩ホルぴー', '鸠'],
+    '隅田川星人':   ['隅田川星人', 'The ALiEN', 'The Dove', '七味星人', '超七味星人',
+                   '隅田川華火大会', '川哥'],
+    'ロシェ@ペンギン': ['ロシェ@ペンギン', '3､了ﾅﾆ', '企鹅'],
+    '群青リコリス':  ['群青リコリス', 'Licorice Gunjyo'],
+    'ぴちネコ':     ['ぴちネコ', 'ぴちネコ)', 'はぴネコ(はっぴー', 'はぴネコ)',
+                   '桃子猫', '桃猫'],
+    'ものくろっく':  ['ものくろっく', 'ものくロシェ'],
+    'カマボコ君':   ['カマボコ君', 'ボコ太'],
+    'あまくちジンジャー': ['あまくちジンジャー', 'あまくちヘルツ'],
+    '玉子豆腐':     ['玉子豆腐', 'safaTAmago'],
+    '華火職人':     ['華火職人', '华火业人'],
+    'チャン@DP皆伝': ['チャン@DP皆伝', 'dp皆传'],
+    'mai-Star':   ['mai-Star', 'maistar'],
+    'ニャイン':     ['ニャイン', '二爷', '二大爷'],
+    'rioN':       ['rioN', 'rion'],
+    'アマリリス':   ['アマリリス', '莉莉丝'],
+    'じゃこレモン':  ['じゃこレモン', '柠檬'],
+}
+
+# 双向索引：任意别名 → 组内全部别名（小写）
+_CHARTER_EXPAND: dict[str, set[str]] = {}
+for _aliases in _CHARTER_ALIASES.values():
+    _all_lower = {a.lower() for a in _aliases}
+    for a in _all_lower:
+        _CHARTER_EXPAND[a] = _all_lower
+
+
+def expand_charter_kw(kw: str) -> set[str]:
+    """将谱师搜索词展开为该谱师所有别名（用于双向子串匹配）"""
+    kw_low = kw.lower().strip()
+    result: set[str] = {kw_low}
+    if kw_low in _CHARTER_EXPAND:
+        result.update(_CHARTER_EXPAND[kw_low])
+    else:
+        for alias, group in _CHARTER_EXPAND.items():
+            if kw_low in alias or alias in kw_low:
+                result.update(group)
+    return result
+
+
 class MaimaiAPI:
     """舞萌 DX 查分 API 封装"""
 
@@ -162,8 +224,9 @@ class MaimaiAPI:
                 # 搜索所有谱面的谱师（charter + notes，大小写不敏感，简繁自动兼容）
                 found = False
                 kw_src = charter.lower()
-                # 生成简/繁两种形式覆盖日文汉字
+                # 生成简/繁两种形式 + 别名展开
                 kw_variants = {kw_src, normalize_cjk(kw_src, "traditional"), normalize_cjk(kw_src, "simplified")}
+                kw_variants.update(expand_charter_kw(kw_src))
                 for c in s.charts.values():
                     # 检查 charter 字段
                     if c.charter:

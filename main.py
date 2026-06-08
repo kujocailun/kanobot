@@ -36,7 +36,7 @@ from nonebot.adapters.onebot.v11 import (
 )
 from nonebot.params import CommandArg
 
-from api import MaimaiAPI
+from api import MaimaiAPI, expand_charter_kw
 
 from renderer import B50Renderer, FilteredScoreRenderer
 from store import bind_user, unbind_user, get_token
@@ -954,6 +954,7 @@ async def _handle_score_list(event: MessageEvent, criteria: dict, page: int):
             if chart:
                 kw_src = criteria["charter"].lower()
                 kw_vars = {kw_src, normalize_cjk(kw_src, "traditional"), normalize_cjk(kw_src, "simplified")}
+                kw_vars.update(expand_charter_kw(kw_src))
                 matched = False
                 if chart.charter and any(k in chart.charter.lower() for k in kw_vars):
                     matched = True
