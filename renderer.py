@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 from datetime import datetime
 from typing import Optional
 
@@ -148,7 +149,7 @@ _FONT_DB = {
     },
 }
 
-FONT_DIR = "C:/Windows/Fonts"
+FONT_DIR = "C:/Windows/Fonts" if sys.platform == "win32" else "/usr/share/fonts/truetype"
 
 _font_cache: dict[tuple[str, int, str], ImageFont.FreeTypeFont] = {}
 
@@ -206,6 +207,34 @@ def _font_xb(size: int, family: str = "mplus") -> ImageFont.FreeTypeFont:
         except (OSError, IOError):
             continue
     return _font(size, family=family, bold=True)
+
+
+_cjk_font_cache: dict[int, ImageFont.FreeTypeFont] = {}
+
+def _cjk_font(size: int) -> ImageFont.FreeTypeFont:
+    """中文字体 — Linux 用文泉驿微米黑（覆盖简体字），Windows 退回 Mplus"""
+    if size in _cjk_font_cache:
+        return _cjk_font_cache[size]
+    cjk_paths = []
+    if sys.platform != "win32":
+        cjk_paths.append("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc")
+    # 回退到 Mplus
+    info = _FONT_DB.get("mplus", _FONT_DB["mplus"])
+    mp = info.get("m", list(info.values())[0])
+    if isinstance(mp, str):
+        mp = [mp]
+    cjk_paths.extend(mp)
+    for p in cjk_paths:
+        try:
+            if os.path.exists(p):
+                f = ImageFont.truetype(p, size)
+                _cjk_font_cache[size] = f
+                return f
+        except (OSError, IOError):
+            continue
+    f = _font(size)
+    _cjk_font_cache[size] = f
+    return f
 
 
 # ══════════════════════════════════════════════════════════════
@@ -500,7 +529,7 @@ class B50Renderer:
 
     def to_bytes(self) -> bytes:
         buf = io.BytesIO()
-        self.img.save(buf, format="PNG")
+        self.img.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
 
     # ── 头部 ──
@@ -792,7 +821,7 @@ class FilteredScoreRenderer:
 
     def to_bytes(self) -> bytes:
         buf = io.BytesIO()
-        self.img.save(buf, format="PNG")
+        self.img.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
 
     def _render_b50(self) -> Image.Image:
@@ -836,7 +865,7 @@ class FilteredScoreRenderer:
         if self.title:
             self.draw.text(
                 (MARGIN, y + 92), self.title,
-                fill=TEXT_DIM, font=_font(18), stroke_width=1,
+                fill=TEXT_DIM, font=_cjk_font(18), stroke_width=1,
             )
 
         # 统计信息
@@ -885,13 +914,13 @@ class FilteredScoreRenderer:
             self.draw.text(
                 (MARGIN, detail_y),
                 f"共 {len(self.records)} 首  |  {sort_label}",
-                fill=TEXT, font=_font(18), stroke_width=1,
+                fill=TEXT, font=_cjk_font(18), stroke_width=1,
             )
             if self.total_pages > 1:
                 self.draw.text(
                     (MARGIN, detail_y + 28),
                     f"第 {self.page}/{self.total_pages} 页（共 {len(self.records)} 首）",
-                    fill=TEXT_DIM, font=_font(16), stroke_width=1,
+                    fill=TEXT_DIM, font=_cjk_font(16), stroke_width=1,
                 )
 
         return y + h
@@ -987,7 +1016,7 @@ class ImportDiffRenderer:
 
     def to_bytes(self) -> bytes:
         buf = io.BytesIO()
-        self.img.save(buf, format="PNG")
+        self.img.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
 
     def _draw_header(self, y: int) -> int:
