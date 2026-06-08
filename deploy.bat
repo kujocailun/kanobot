@@ -8,14 +8,14 @@ if not exist "server.conf" (
 )
 set /p SERVER_IP=<server.conf
 
-echo === Uploading kanobot files ===
-scp -r *.py requirements.txt restart.sh root@%SERVER_IP%:/root/kanobot/
+echo === Uploading all files ===
+scp *.py requirements.txt restart.sh songdb\maidata.json root@%SERVER_IP%:/root/kanobot/
 if %errorlevel% neq 0 (
     echo Upload failed!
     pause
     exit /b
 )
-echo === Restarting bot on server ===
-ssh root@%SERVER_IP% "bash /root/kanobot/restart.sh"
+echo === Restarting bot ===
+ssh root@%SERVER_IP% "mkdir -p /root/kanobot/songdb/cover && mv /root/kanobot/maidata.json /root/kanobot/songdb/ && bash /root/kanobot/restart.sh"
 echo === Done! ===
 pause

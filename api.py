@@ -52,6 +52,10 @@ class MaimaiAPI:
         self._song_aliases: dict[int, list[str]] = {}
         self._alias_loaded: bool = False
 
+        # 本地歌曲封面库 (CrazyKidCN maidata.json，已预置 song_id)
+        self._id_to_cover: dict[str, str] = {}     # song_id → image_file
+        self._songdb_loaded: bool = False
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=30.0)
@@ -465,13 +469,65 @@ class MaimaiAPI:
     # ══════════════════════════════════════════════════
 
     COVER_CACHE = os.path.join(os.path.dirname(__file__), "cache", "covers")
+    SONGDB_DIR = os.path.join(os.path.dirname(__file__), "songdb")
+    SONGDB_COVER_DIR = os.path.join(SONGDB_DIR, "cover")
+    SONGDB_JSON = os.path.join(SONGDB_DIR, "maidata.json")
+
+    def _load_songdb(self):
+        """加载本地歌曲数据库，构建 ID→封面 映射（直接从 song_id 字段读取）"""
+        self._id_to_cover.clear()
+        if not os.path.isfile(self.SONGDB_JSON):
+            logger.info("[cover] songdb/maidata.json 不存在，跳过本地封面库")
+            self._songdb_loaded = True
+            return
+        try:
+            with open(self.SONGDB_JSON, "r", encoding="utf-8") as f:
+                songs = json.load(f)
+            for entry in songs:
+                sid = str(entry.get("song_id") or "")
+                img = entry.get("image_file") or ""
+                if sid and img:
+                    self._id_to_cover[sid] = img
+                    # DX 歌曲同步到 SD ID（如 10371 → 371）
+                    try:
+                        mid = int(sid)
+                        if 10000 < mid <= 11000:
+                            self._id_to_cover[str(mid - 10000)] = img
+                    except ValueError:
+                        pass
+            logger.info(f"[cover] 本地封面库就绪: {len(self._id_to_cover)} 首")
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"[cover] 本地封面库加载失败: {e}")
+        self._songdb_loaded = True
+
+    def _get_local_cover(self, song_id: int | str) -> bytes | None:
+        """从本地 songdb 读取封面（O(1) ID 查找，启动时已预匹配）"""
+        if not os.path.isdir(self.SONGDB_COVER_DIR):
+            return None
+        if not self._songdb_loaded:
+            self._load_songdb()
+
+        image_file = self._id_to_cover.get(str(song_id))
+        if not image_file:
+            return None
+
+        cover_path = os.path.join(self.SONGDB_COVER_DIR, image_file)
+        if not os.path.isfile(cover_path):
+            return None
+        try:
+            data = open(cover_path, "rb").read()
+            if data and len(data) > 1000:
+                return data
+        except OSError:
+            pass
+        return None
 
     async def download_covers(
         self, song_ids: list[int], max_concurrent: int = 12,
     ) -> dict[str, bytes]:
         """
         批量下载歌曲封面，优先读本地缓存。
-        多源回退：diving-fish → 备选 CDN → 占位图
+        回退顺序：缓存 → 本地 songdb → diving-fish URL → 占位图
         返回 {song_id: raw_png_bytes}
         """
         os.makedirs(self.COVER_CACHE, exist_ok=True)
@@ -489,23 +545,31 @@ class MaimaiAPI:
 
         async def fetch_one(sid: int):
             async with sem:
-                # 本地缓存命中
                 cache_path = os.path.join(self.COVER_CACHE, f"{sid}.png")
+
+                # 1. 本地缓存命中（最快）
                 if os.path.exists(cache_path):
                     data = open(cache_path, "rb").read()
                     if data:
                         result[str(sid)] = data
                         return
-                    # 缓存是空的（旧 bug 产物），删掉重下
-                    os.remove(cache_path)
+                    os.remove(cache_path)  # 空文件，删掉重取
 
-                # 多源尝试
+                # 2. 本地 songdb（磁盘读取，无网络开销）
+                data = self._get_local_cover(sid)
+                if data:
+                    result[str(sid)] = data
+                    with open(cache_path, "wb") as f:
+                        f.write(data)
+                    return
+
+                # 3. 多源 URL 回退
                 for url in _cover_urls(sid):
                     try:
                         resp = await client.get(url)
                         resp.raise_for_status()
                         data = resp.content
-                        if data and len(data) > 1000:  # 过滤 404 页面
+                        if data and len(data) > 1000:
                             result[str(sid)] = data
                             with open(cache_path, "wb") as f:
                                 f.write(data)
@@ -513,7 +577,7 @@ class MaimaiAPI:
                     except Exception:
                         continue
 
-                # 所有源都失败
+                # 4. 所有源都失败
                 result[str(sid)] = b""
 
         tasks = [fetch_one(sid) for sid in song_ids]

@@ -22,5 +22,8 @@ debug_qr_import.py
 test_run.py
 _font_*.png
 
+# Song cover database (CrazyKidCN)
+songdb/
+
 # Design reference
 design/

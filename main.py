@@ -32,6 +32,7 @@ from nonebot.adapters.onebot.v11 import (
     MessageSegment,
     GroupMessageEvent,
     PokeNotifyEvent,
+    Adapter as OneBotV11Adapter,
 )
 from nonebot.params import CommandArg
 
@@ -99,6 +100,15 @@ async def on_bot_connect(bot: Bot):
 @driver.on_bot_disconnect
 async def on_bot_disconnect(bot: Bot):
     logger.warning(f"[DISCONNECT] Bot 断开连接! self_id={bot.self_id}")
+    # 强制清理 OneBot 适配器缓存的旧连接，防止重连时 403
+    await asyncio.sleep(1)
+    for adapter in driver._adapters.values():
+        if isinstance(adapter, OneBotV11Adapter):
+            bots = getattr(adapter, 'bots', {})
+            stale_keys = [k for k in bots if str(k) == str(bot.self_id)]
+            for k in stale_keys:
+                bots.pop(k, None)
+                logger.info(f"[DISCONNECT] 已清理适配器缓存: self_id={k}")
 
 
 @driver.on_startup
@@ -289,6 +299,13 @@ NOT_BOUND_MSG = (
     "  Token 可获取完整成绩（不限于B50），且不受隐私设置影响"
 )
 
+NEED_TOKEN_MSG = (
+    "❌ 此功能需要 Import-Token！\n\n"
+    "QQ公查只能获取 B50（50条成绩），无法用于完整筛选。\n"
+    "请在私聊中使用: bind <用户名> <Import-Token>\n"
+    "获取: https://www.diving-fish.com/maimaidx/prober/ → 编辑个人资料 → 生成 Import-Token"
+)
+
 
 async def resolve_username(event: MessageEvent) -> str:
     """解析水鱼用户名：本地绑定 → QQ公查（需在水鱼绑定了QQ且隐私公开）"""
@@ -321,13 +338,10 @@ async def handle_b50(event: MessageEvent):
     if isinstance(event, GroupMessageEvent):
         await b50_cmd.send(f"正在生成 {username} 的 B50 成绩表...")
 
-    # 有 token 走完整接口，否则公开B50
-    t = get_token(str(event.user_id))
-    profile = None
-    if t:
-        profile = await api.get_player_full_records(import_token=t[1])
+    # 优先用 QQ 公查（不需要 token，省配额）
+    profile = await api.get_player_data(username=username)
     if not profile:
-        profile = await api.get_player_data(username=username)
+        profile = await api.get_player_data(qq=str(event.user_id))
     if not profile:
         await b50_cmd.finish(f"未找到玩家 [{username}]，或该玩家设置了隐私保护")
 
@@ -357,13 +371,10 @@ async def handle_rating(event: MessageEvent):
     if not username:
         await rating_cmd.finish(NOT_BOUND_MSG)
 
-    # 有 token 走完整接口，否则公开B50
-    t = get_token(str(event.user_id))
-    profile = None
-    if t:
-        profile = await api.get_player_full_records(import_token=t[1])
+    # 优先用 QQ 公查（不需要 token，省配额）
+    profile = await api.get_player_data(username=username)
     if not profile:
-        profile = await api.get_player_data(username=username)
+        profile = await api.get_player_data(qq=str(event.user_id))
     if not profile:
         await rating_cmd.finish(f"未找到玩家 [{username}]")
 
@@ -419,7 +430,7 @@ def _format_song_compact(s) -> str:
     return "\n".join(lines)
 
 
-def _build_song_detail(song, records: list, username: str) -> str:
+def _build_song_detail(song, records: list, username: str, has_token: bool = False) -> str:
     """构造歌曲详情（含谱面信息 + 可选个人成绩）"""
     type_tag = "[DX]" if song.type == "dx" else "[SD]"
     new_tag = " 🆕 新曲" if song.is_new else ""
@@ -430,7 +441,6 @@ def _build_song_detail(song, records: list, username: str) -> str:
              f"分类: {song.genre}  |  BPM: {song.bpm}  |  版本: {ver_display}"]
     if song.release_date:
         lines.append(f"发布日期: {song.release_date}")
-    lines.append(f"封面: {api.get_cover_url(song.song_id)}")
     lines.append("──── 谱面信息 ────")
     for i in range(min(5, len(song.charts))):
         c = song.charts.get(i)
@@ -449,10 +459,15 @@ def _build_song_detail(song, records: list, username: str) -> str:
             lines.append(f"{rec.level_label}: {rec.achievements}% | {rate_label}{fc_tag}{fs_tag} | RA:{rec.ra}")
         best_ra = max(r.ra for r in records)
         lines.append(f"该曲最高 RA: {best_ra}")
-    elif username:
+    elif username and has_token:
         lines.append(f"──── {username} 暂无此曲成绩 ────")
+    elif username and not has_token:
+        lines.append("────\n⚠️ 个人成绩需要 Import-Token（QQ公查只能获取B50）")
+        lines.append("请私聊: bind <用户名> <Import-Token>")
     else:
-        lines.append("────\n⚠️ 未绑定且QQ公查无结果，无法获取个人成绩。\n方式一: 在水鱼官网绑定QQ并设为公开\n方式二: 私聊 bind <用户名> <Import-Token>")
+        lines.append("────\n⚠️ 无法获取个人成绩。")
+        lines.append("方式一: 在水鱼官网绑定QQ并设为公开")
+        lines.append("方式二: 私聊 bind <用户名> <Import-Token>")
     return "\n".join(lines)
 
 
@@ -465,16 +480,18 @@ async def _lookup_song(keyword: str, event: MessageEvent):
     if keyword.isdigit():
         song = api.get_song_by_id(keyword)
         if not song:
-            return f"未找到歌曲 ID [{keyword}]"
+            return f"未找到歌曲 ID [{keyword}]", None
         username = await resolve_username(event)
         records = []
-        if username:
-            t = get_token(str(event.user_id))
+        t = get_token(str(event.user_id))
+        if t:
             _, records = await api.get_song_player_record(
                 keyword, username=username,
-                import_token=t[1] if t else "",
+                import_token=t[1],
             )
-        return _build_song_detail(song, records, username)
+        covers = await api.download_covers([int(song.song_id)])
+        cover = covers.get(song.song_id)
+        return _build_song_detail(song, records, username, has_token=bool(t)), cover
 
     # ── 别名搜索 ──
     alias_song_ids = api.search_by_alias(keyword)
@@ -507,20 +524,22 @@ async def _lookup_song(keyword: str, event: MessageEvent):
             combined.append(s)
 
     if not combined:
-        return f"未找到包含 [{keyword}] 的歌曲\n────\n试试搜别名: info <常用称呼>"
+        return f"未找到包含 [{keyword}] 的歌曲\n────\n试试搜别名: info <常用称呼>", None
 
     # 唯一结果 → 详情
     if len(combined) == 1:
         song = combined[0]
         username = await resolve_username(event)
         records = []
-        if username:
-            t = get_token(str(event.user_id))
+        t = get_token(str(event.user_id))
+        if t:
             _, records = await api.get_song_player_record(
                 song.song_id, username=username,
-                import_token=t[1] if t else "",
+                import_token=t[1],
             )
-        return _build_song_detail(song, records, username)
+        covers = await api.download_covers([int(song.song_id)])
+        cover = covers.get(song.song_id)
+        return _build_song_detail(song, records, username, has_token=bool(t)), cover
 
     # 多结果 → 列表（标注匹配来源）
     msg = f"搜索 [{keyword}] — {len(combined)} 首\n────\n"
@@ -534,7 +553,7 @@ async def _lookup_song(keyword: str, event: MessageEvent):
             f"{s.title} (id=", f"{s.title}{tag} (id=", 1
         ) + "\n"
     msg += "────\n用 info <id> 查看歌曲详情"
-    return msg
+    return msg, None
 
 
 @info_cmd.handle()
@@ -546,8 +565,11 @@ async def handle_info(event: MessageEvent, args: Message = CommandArg()):
     if isinstance(event, GroupMessageEvent):
         await info_cmd.send("正在查询...")
 
-    msg = await _lookup_song(keyword, event)
-    await info_cmd.finish(MessageSegment.text(msg))
+    msg, cover = await _lookup_song(keyword, event)
+    if cover:
+        await info_cmd.finish(MessageSegment.text(msg) + MessageSegment.image(cover))
+    else:
+        await info_cmd.finish(MessageSegment.text(msg))
 
 
 @whatsong.handle()
@@ -561,8 +583,11 @@ async def handle_what_song(event: MessageEvent):
     if not keyword:
         await whatsong.finish("用法: <歌曲id或曲名>是什么歌\n示例: 11357是什么歌  |  ウミユリ是什么歌")
 
-    msg = await _lookup_song(keyword, event)
-    await whatsong.finish(MessageSegment.text(msg))
+    msg, cover = await _lookup_song(keyword, event)
+    if cover:
+        await whatsong.finish(MessageSegment.text(msg) + MessageSegment.image(cover))
+    else:
+        await whatsong.finish(MessageSegment.text(msg))
 
 from models import (
     VERSION_CODES, VERSION_NAME_TO_CODE,
@@ -834,23 +859,17 @@ async def _parse_compact(text: str) -> tuple[dict, str, int]:
     return criteria, mode, page
 
 
-async def _fetch_player_full(username: str, qq: str):
-    """获取玩家完整数据 — Import-Token → 公开用户名 → 公开QQ"""
+async def _fetch_player_full(qq: str):
+    """获取玩家完整数据 — 仅 Import-Token，无 token 返回 None"""
     t = get_token(qq)
-    if t:
-        _, token = t
-        full = await api.get_player_full_records(import_token=token)
-        if full and full.records:
-            logger.info(f"[compact] 完整接口获取 {len(full.records)} 条成绩")
-            return full
-
-    # 回退到公开接口：先按用户名，再按QQ
-    profile = await api.get_player_data(username=username)
-    if profile and profile.records:
-        logger.info(f"[compact] 公开接口(username)获取 {len(profile.records)} 条成绩")
-        return profile
-    logger.info(f"[compact] 回退到公开接口(qq)")
-    return await api.get_player_data(qq=qq)
+    if not t:
+        return None
+    _, token = t
+    full = await api.get_player_full_records(import_token=token)
+    if full and full.records:
+        logger.info(f"[compact] 完整接口获取 {len(full.records)} 条成绩")
+        return full
+    return None
 
 
 # ── 分数列表 消息处理器 ──
@@ -859,14 +878,13 @@ async def _handle_score_list(event: MessageEvent, criteria: dict, page: int):
     username = await resolve_username(event)
     if not username:
         await compact_msg.finish(NOT_BOUND_MSG)
-        return
+
+    profile = await _fetch_player_full(str(event.user_id))
+    if not profile:
+        await compact_msg.finish(NEED_TOKEN_MSG)
 
     if isinstance(event, GroupMessageEvent):
         await compact_msg.send(f"正在生成 {username} 的成绩列表...")
-
-    profile = await _fetch_player_full(username, str(event.user_id))
-    if not profile or not profile.records:
-        await compact_msg.finish(f"未找到玩家 [{username}] 的成绩记录")
     await api.enrich_records(profile)
 
     # 筛选
@@ -967,17 +985,17 @@ async def handle_compact_filter(event: MessageEvent):
         if not username:
             await compact_msg.finish(
                 f"❌ 条件B50需要绑定水鱼账号！\n\n"
-                f"方式一（推荐）: 在水鱼官网绑定QQ并设为公开 → 直接 kano <条件>b50\n"
+                f"方式一（推荐）: 在水鱼官网绑定QQ并设为公开 → 直接 kano b50\n"
                 f"方式二: 私聊 bind <用户名> <Import-Token>\n\n"
                 f"不加 50 可只看曲库筛选（无需账号）"
             )
 
+        profile = await _fetch_player_full(str(event.user_id))
+        if not profile:
+            await compact_msg.finish(NEED_TOKEN_MSG)
+
         if isinstance(event, GroupMessageEvent):
             await compact_msg.send(f"正在生成 {username} 的筛选B50...")
-
-        profile = await _fetch_player_full(username, str(event.user_id))
-        if not profile or not profile.records:
-            await compact_msg.finish(f"未找到玩家 [{username}] 的成绩记录")
         await api.enrich_records(profile)
 
         # 筛选成绩
