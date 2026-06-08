@@ -280,16 +280,31 @@ def build_player_summary(player) -> str:
 # ══════════════════════════════════════════════════
 
 NOT_BOUND_MSG = (
-    "❌ 尚未绑定水鱼账号！\n"
-    "请在私聊中使用: bind <水鱼用户名> <Import-Token>\n\n"
-    "获取 Token: https://www.diving-fish.com/maimaidx/prober/ → 编辑个人资料 → 生成 Import-Token"
+    "❌ 未找到你的水鱼账号！\n\n"
+    "方式一（推荐）: 在水鱼官网绑定 QQ 并设为公开\n"
+    "  https://www.diving-fish.com/maimaidx/prober/ → 编辑个人资料 → 绑定QQ号\n"
+    "  完成后直接发 kano b50 即可查分\n\n"
+    "方式二（可选）: 私聊发送 bind <用户名> <Import-Token>\n"
+    "  同一页面 → 生成 Import-Token\n"
+    "  Token 可获取完整成绩（不限于B50），且不受隐私设置影响"
 )
 
 
-def resolve_username(event: MessageEvent) -> str:
-    """从绑定数据中解析当前用户的水鱼用户名，未绑定返回空字符串"""
+async def resolve_username(event: MessageEvent) -> str:
+    """解析水鱼用户名：本地绑定 → QQ公查（需在水鱼绑定了QQ且隐私公开）"""
     t = get_token(str(event.user_id))
-    return t[0] if t else ""
+    if t:
+        return t[0]
+
+    # 无本地绑定 → 尝试 QQ 公查
+    try:
+        profile = await api.get_player_data(qq=str(event.user_id))
+        if profile and profile.nickname:
+            return profile.nickname
+    except Exception:
+        pass
+
+    return ""
 
 
 # ══════════════════════════════════════════════════
@@ -299,14 +314,20 @@ def resolve_username(event: MessageEvent) -> str:
 @b50_cmd.handle()
 async def handle_b50(event: MessageEvent):
     """b50 — 生成 B50 成绩表图片（5列卡片网格，前7行B35 + 后3行B15）"""
-    username = resolve_username(event)
+    username = await resolve_username(event)
     if not username:
         await b50_cmd.finish(NOT_BOUND_MSG)
 
     if isinstance(event, GroupMessageEvent):
         await b50_cmd.send(f"正在生成 {username} 的 B50 成绩表...")
 
-    profile = await api.get_player_data(username=username)
+    # 有 token 走完整接口，否则公开B50
+    t = get_token(str(event.user_id))
+    profile = None
+    if t:
+        profile = await api.get_player_full_records(import_token=t[1])
+    if not profile:
+        profile = await api.get_player_data(username=username)
     if not profile:
         await b50_cmd.finish(f"未找到玩家 [{username}]，或该玩家设置了隐私保护")
 
@@ -332,11 +353,17 @@ async def handle_b50(event: MessageEvent):
 
 @rating_cmd.handle()
 async def handle_rating(event: MessageEvent):
-    username = resolve_username(event)
+    username = await resolve_username(event)
     if not username:
         await rating_cmd.finish(NOT_BOUND_MSG)
 
-    profile = await api.get_player_data(username=username)
+    # 有 token 走完整接口，否则公开B50
+    t = get_token(str(event.user_id))
+    profile = None
+    if t:
+        profile = await api.get_player_full_records(import_token=t[1])
+    if not profile:
+        profile = await api.get_player_data(username=username)
     if not profile:
         await rating_cmd.finish(f"未找到玩家 [{username}]")
 
@@ -425,7 +452,7 @@ def _build_song_detail(song, records: list, username: str) -> str:
     elif username:
         lines.append(f"──── {username} 暂无此曲成绩 ────")
     else:
-        lines.append("────\n⚠️ 尚未绑定水鱼账号，无法获取个人成绩。\n请在私聊中使用: bind <水鱼用户名> <密码>")
+        lines.append("────\n⚠️ 未绑定且QQ公查无结果，无法获取个人成绩。\n方式一: 在水鱼官网绑定QQ并设为公开\n方式二: 私聊 bind <用户名> <Import-Token>")
     return "\n".join(lines)
 
 
@@ -439,7 +466,7 @@ async def _lookup_song(keyword: str, event: MessageEvent):
         song = api.get_song_by_id(keyword)
         if not song:
             return f"未找到歌曲 ID [{keyword}]"
-        username = resolve_username(event)
+        username = await resolve_username(event)
         records = []
         if username:
             t = get_token(str(event.user_id))
@@ -485,7 +512,7 @@ async def _lookup_song(keyword: str, event: MessageEvent):
     # 唯一结果 → 详情
     if len(combined) == 1:
         song = combined[0]
-        username = resolve_username(event)
+        username = await resolve_username(event)
         records = []
         if username:
             t = get_token(str(event.user_id))
@@ -550,7 +577,7 @@ from models import (
 
 @rank_cmd.handle()
 async def handle_rank(event: MessageEvent):
-    username = resolve_username(event)
+    username = await resolve_username(event)
     if not username:
         await rank_cmd.finish(NOT_BOUND_MSG)
 
@@ -808,7 +835,7 @@ async def _parse_compact(text: str) -> tuple[dict, str, int]:
 
 
 async def _fetch_player_full(username: str, qq: str):
-    """获取玩家完整数据 — 有 Import-Token 走完整接口，否则回退公开 B50"""
+    """获取玩家完整数据 — Import-Token → 公开用户名 → 公开QQ"""
     t = get_token(qq)
     if t:
         _, token = t
@@ -817,19 +844,21 @@ async def _fetch_player_full(username: str, qq: str):
             logger.info(f"[compact] 完整接口获取 {len(full.records)} 条成绩")
             return full
 
-    # 回退到公开 B50
-    logger.info(f"[compact] 回退到公开B50接口")
-    return await api.get_player_data(username=username)
+    # 回退到公开接口：先按用户名，再按QQ
+    profile = await api.get_player_data(username=username)
+    if profile and profile.records:
+        logger.info(f"[compact] 公开接口(username)获取 {len(profile.records)} 条成绩")
+        return profile
+    logger.info(f"[compact] 回退到公开接口(qq)")
+    return await api.get_player_data(qq=qq)
 
 
 # ── 分数列表 消息处理器 ──
 async def _handle_score_list(event: MessageEvent, criteria: dict, page: int):
     """处理 分数列表 请求：筛选+排序+分页+出图"""
-    username = resolve_username(event)
+    username = await resolve_username(event)
     if not username:
-        await compact_msg.finish(
-            f"❌ 分数列表需要绑定水鱼账号！\n请先在私聊中使用: bind <水鱼用户名> <密码>"
-        )
+        await compact_msg.finish(NOT_BOUND_MSG)
         return
 
     if isinstance(event, GroupMessageEvent):
@@ -934,11 +963,13 @@ async def handle_compact_filter(event: MessageEvent):
 
     # ── B50 图片模式 ──
     if mode == "b50":
-        username = resolve_username(event)
+        username = await resolve_username(event)
         if not username:
             await compact_msg.finish(
-                f"❌ 条件B50需要绑定水鱼账号！\n请先在私聊中使用: bind <水鱼用户名> <密码>\n\n"
-                f"不加 50 可只看曲库筛选"
+                f"❌ 条件B50需要绑定水鱼账号！\n\n"
+                f"方式一（推荐）: 在水鱼官网绑定QQ并设为公开 → 直接 kano <条件>b50\n"
+                f"方式二: 私聊 bind <用户名> <Import-Token>\n\n"
+                f"不加 50 可只看曲库筛选（无需账号）"
             )
 
         if isinstance(event, GroupMessageEvent):
