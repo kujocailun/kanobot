@@ -57,16 +57,9 @@ async def kano_prefix(event: Event):
 
     # 群聊 @bot 优先处理 — 即使无文本也要响应
     if isinstance(event, GroupMessageEvent):
-        bot_id = str(event.self_id)
-        segs = [(s.type, s.data) for s in event.message]
-        is_tome = event.is_tome()
-        logger.info(f"[@DEBUG] self_id={bot_id} is_tome={is_tome} segs={segs}")
-        if is_tome:
-            # 移除 @bot 的 at 段 或 CQ码文本
-            remaining = [
-                seg for seg in event.message
-                if not (seg.type == 'at' and str(seg.data.get('qq', '')) == bot_id)
-            ]
+        if event.is_tome():
+            # 移除 @bot 的 at 段
+            remaining = [seg for seg in event.message if seg.type != 'at']
             at_text = Message(remaining).extract_plain_text().strip()
             # 也清除文本中的 CQ at 码残留
             at_text = re.sub(r'\[CQ:at,qq=\d+\]', '', at_text).strip()
@@ -111,7 +104,10 @@ async def kano_prefix(event: Event):
     if _parse_arcade_cmd(text) or text in ('排卡', 'j'):
         return
     first_word = text.split()[0].lower()
-    if first_word in _KNOWN_CMD_FIRST or text.endswith('是什么歌'):
+    # 也屏蔽「id11569」这种命令+数字粘连写法（NoneBot做前缀匹配）
+    cmd_prefix = re.match(r'^([a-zA-Z一-鿿]+)(\d.*)?$', first_word)
+    if first_word in _KNOWN_CMD_FIRST or text.endswith('是什么歌') \
+       or (cmd_prefix and cmd_prefix.group(1) in _KNOWN_CMD_FIRST):
         event.message = Message(MessageSegment.text(''))
         return
     if _detect_compact_filter(text):
@@ -512,6 +508,24 @@ async def _lookup_song(keyword: str, event: MessageEvent):
         song = api.get_song_by_id(keyword)
         if not song:
             return f"未找到歌曲 ID [{keyword}]", None
+
+        # 查找同曲名的其它 ID（SD/DX 或不同版本）
+        same_name = [
+            s for s in api._song_list
+            if str(s.song_id) != keyword and s.title.strip() == song.title.strip()
+        ]
+        if same_name:
+            # 多版本聚合成列表
+            all_versions = [song] + same_name
+            msg = f"「{song.title}」有 {len(all_versions)} 个 ID\n────\n"
+            for s in all_versions:
+                msg += _format_song_compact(s) + "\n"
+            msg += "────\n用 info <id> 查看具体版本详情"
+            # 优先取第一个版本的封面
+            covers = await api.download_covers([int(s.song_id)])
+            cover = covers.get(s.song_id)
+            return msg, cover
+
         username = await resolve_username(event)
         records = []
         t = get_token(str(event.user_id))
@@ -520,8 +534,8 @@ async def _lookup_song(keyword: str, event: MessageEvent):
                 keyword, username=username,
                 import_token=t[1],
             )
-        covers = await api.download_covers([int(song.song_id)])
-        cover = covers.get(song.song_id)
+        covers = await api.download_covers([int(s.song_id)])
+        cover = covers.get(s.song_id)
         return _build_song_detail(song, records, username, has_token=bool(t)), cover
 
     # ── 别名搜索 ──
