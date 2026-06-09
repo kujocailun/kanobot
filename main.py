@@ -40,9 +40,18 @@ from api import MaimaiAPI, expand_charter_kw
 
 from renderer import B50Renderer, FilteredScoreRenderer
 from store import bind_user, unbind_user, get_token
+from tag_provider import get_tag_provider
 
 api = MaimaiAPI()
 _at_events = set()  # 记录由 @bot 触发的群聊消息，用于无效命令回退
+
+
+def _rewrite_tag_command(s: str) -> str:
+    """「交互练什么」→「练什么 交互」（配置名前置的练什么命令兼容）"""
+    m = re.match(r'^(.+?)练什么\s*$', s)
+    if m:
+        return f'练什么 {m.group(1).strip()}'
+    return s
 
 
 # ══════════════════════════════════════════════════════
@@ -74,7 +83,7 @@ async def kano_prefix(event: Event):
                 if f'kano{at_text}' in _WAKE_WORDS:
                     event.message = Message(MessageSegment.text(f'kano{at_text}'))
                 else:
-                    event.message = Message(MessageSegment.text(at_text))
+                    event.message = Message(MessageSegment.text(_rewrite_tag_command(at_text)))
                     _at_events.add(id(event))
             else:
                 event.message = Message(MessageSegment.text('kano呢'))
@@ -90,16 +99,18 @@ async def kano_prefix(event: Event):
 
     # 私聊 — 直接放行（无需前缀）
     if not isinstance(event, GroupMessageEvent):
-        # 有 kano 前缀则剥离
+        # 有 kano 前缀则剥离，然后改写「X练什么」→「练什么 X」
         m = re.match(r'(?i:kano)\s*(.+)', text)
         if m:
-            event.message = Message(MessageSegment.text(m.group(1)))
+            event.message = Message(MessageSegment.text(_rewrite_tag_command(m.group(1))))
+        else:
+            event.message = Message(MessageSegment.text(_rewrite_tag_command(text)))
         return
 
     # 群聊 — 有 kano 前缀则剥离放行
     m = re.match(r'(?i:kano)\s*(.+)', text)
     if m:
-        event.message = Message(MessageSegment.text(m.group(1)))
+        event.message = Message(MessageSegment.text(_rewrite_tag_command(m.group(1))))
         return
 
     # 群聊无前缀 → 屏蔽命令类消息，避免多 Bot 误触
@@ -248,10 +259,6 @@ async def handle_repeat(bot: Bot, event: GroupMessageEvent):
     if not isinstance(event, GroupMessageEvent):
         return
     if not _should_count_repeat(event):
-        # 不可计数的消息（图片/回复/语音等）→ 中断复读链，重置计数
-        group_id = str(event.group_id)
-        if _repeat_tracker.get(group_id):
-            del _repeat_tracker[group_id]
         return
 
     text = event.get_plaintext().strip()
@@ -291,6 +298,7 @@ genres_cmd = on_command("genres", aliases={"分类"},             priority=5, bl
 bind_cmd    = on_command("bind",    aliases={"绑定"},             priority=5, block=True)
 unbind_cmd  = on_command("unbind",  aliases={"解绑"},             priority=5, block=True)
 helper_cmd  = on_command("查分帮助", aliases={"kanohelp", "help"}, priority=5, block=True)
+practice_cmd = on_command("练什么", aliases={"练配置", "practice"}, priority=5, block=True)
 
 
 # ══════════════════════════════════════════════════════
@@ -443,6 +451,129 @@ async def handle_rating(event: MessageEvent):
         msg += f"{labels[lv]}:{stats['by_level'].get(lv, 0)}  "
 
     await rating_cmd.finish(MessageSegment.text(msg))
+
+
+# ══════════════════════════════════════════════════════
+# 练习推荐 — 练什么 <配置名>
+# ══════════════════════════════════════════════════════
+
+@practice_cmd.handle()
+async def handle_practice(event: MessageEvent, args: Message = CommandArg()):
+    """练什么 <配置名> — 基于玩家水平推荐带指定配置标签的练习谱面"""
+    tag_kw = args.extract_plain_text().strip()
+
+    provider = get_tag_provider()
+    await provider.ensure_loaded()
+
+    if not tag_kw:
+        all_tags = [t.name_zh for t in provider.get_all_tags()]
+        tag_list = " · ".join(all_tags)
+        await practice_cmd.finish(
+            f"请指定想练的配置名，例如：kano练什么 交互\n\n"
+            f"可用配置标签（{len(all_tags)}个）：\n{tag_list}"
+        )
+
+    # 模糊匹配标签名（提前做，不依赖网络）
+    matches = provider.fuzzy_match_tag(tag_kw)
+    if not matches:
+        all_tags = [t.name_zh for t in provider.get_all_tags()]
+        tag_list = " · ".join(all_tags)
+        await practice_cmd.finish(
+            f"未找到配置「{tag_kw}」\n\n可用配置标签（{len(all_tags)}个）：\n{tag_list}"
+        )
+
+    tag_name = matches[0]
+    match_hint = ""
+    if len(matches) > 1:
+        match_hint = f"（匹配到 {len(matches)} 个：{' / '.join(matches[:5])}，取「{tag_name}」）"
+    elif tag_name != tag_kw:
+        match_hint = f"（匹配到「{tag_name}」）"
+
+    # 获取玩家数据
+    username = await resolve_username(event)
+    if not username:
+        await practice_cmd.finish(NOT_BOUND_MSG)
+
+    try:
+        profile = await _fetch_player_full(str(event.user_id))
+    except Exception as e:
+        logger.error(f"获取玩家完整成绩失败: {e}")
+        await practice_cmd.finish(f"获取成绩数据失败，请稍后重试\n({e})")
+
+    if not profile:
+        await practice_cmd.finish(NEED_TOKEN_MSG)
+
+    # 加载歌曲数据（带超时保护）
+    try:
+        await api.load_music_data()
+    except Exception as e:
+        logger.error(f"加载歌曲库失败: {e}")
+        await practice_cmd.finish(f"加载歌曲数据失败，请稍后重试\n({e})")
+
+    if not api._song_list:
+        await practice_cmd.finish("歌曲数据加载失败，请稍后重试")
+
+    # B50 RA 统计（先算，后续推荐引擎和渲染都要用）
+    SSSP_RATE = 22.4
+    b50 = profile.get_best_n(50)
+    b50_ra = sorted([r.ra for r in b50 if r.ra > 0])
+    floor_ra = b50_ra[0] if b50_ra else 0
+    ceiling_ra = b50_ra[-1] if b50_ra else 0
+    avg_ra = sum(b50_ra) / len(b50_ra) if b50_ra else 0
+
+    # RA → SSS+ 对应定数（SSS+ 时 RA ≈ ds × 22.4）
+    floor_ds = floor_ra / SSSP_RATE if floor_ra > 0 else 0
+    ceiling_ds = ceiling_ra / SSSP_RATE if ceiling_ra > 0 else 0
+    center_ds = floor_ds  # 练习推荐以地板为中心（从舒适区起步）
+
+    if isinstance(event, GroupMessageEvent):
+        await practice_cmd.send(
+            f"正在为 {username} 生成「{tag_name}」练习推荐..."
+        )
+
+    # 推荐引擎
+    recommendations = provider.recommend_charts(
+        tag_name, profile.records, api._song_list, limit=50, center_ds=center_ds,
+    )
+
+    if not recommendations:
+        await practice_cmd.finish(
+            f"「{tag_name}」标签下暂无可用谱面推荐。\n"
+            f"（已匹配到 {len(provider.find_charts_by_tag(tag_name))} 首带此标签的谱面，"
+            f"但歌曲库中未找到对应数据，可能是网络问题）"
+        )
+
+    # 下载封面
+    song_ids = [int(r.song_id) for r in recommendations if r.song_id.isdigit()]
+    covers = await api.download_covers(song_ids)
+
+    # 渲染图片
+    from renderer import RecommendationRenderer
+    renderer = RecommendationRenderer(
+        recommendations, username, tag_name,
+        covers=covers,
+        floor_ra=floor_ra,
+        ceiling_ra=ceiling_ra,
+        avg_ra=avg_ra,
+        floor_ds=floor_ds,
+        ceiling_ds=ceiling_ds,
+        center_ds=center_ds,
+        total_tagged=len(provider.find_charts_by_tag(tag_name)),
+    )
+    renderer.render()
+    img_bytes = renderer.to_bytes()
+
+    # 发送
+    total = len(provider.find_charts_by_tag(tag_name))
+    await practice_cmd.finish(
+        MessageSegment.text(
+            f"【{tag_name} 练习推荐 — {username}】{match_hint}\n"
+            f"B50 RA: {floor_ra:.0f}(底) ~ {ceiling_ra:.0f}(顶)  |  均 {avg_ra:.0f}\n"
+            f"SSS+ 对应定数: {floor_ds:.1f} ~ {ceiling_ds:.1f}  →  推荐中心 {center_ds:.1f}\n"
+            f"共 {total} 首带此标签  |  推荐 {len(recommendations)} 首"
+        ) +
+        MessageSegment.image(img_bytes)
+    )
 
 
 # ══════════════════════════════════════════════════════
@@ -725,6 +856,9 @@ def _build_filter_summary(criteria: dict) -> str:
         parts.append(f"定数{criteria['ds_value']}")
     if criteria["charter"]:
         parts.append(f"谱师:{criteria['charter']}")
+    if criteria.get("fc_status"):
+        fc_labels = {"fc": "FC", "fc+": "FC+", "ap": "AP", "ap+": "AP+"}
+        parts.append(fc_labels.get(criteria["fc_status"], criteria["fc_status"]))
     if criteria["is_new"]:
         parts.append("新歌")
     return " + ".join(parts) if parts else "全部"
@@ -742,7 +876,8 @@ _COMPACT_KW_SOURCE = sorted(
         list(VERSION_CODES.keys()) +
         ['分数列表', 'dx', 'sd', '标准', '旧框', '新歌', '新曲',
          '绿', '黄', '红', '紫', '白',
-         'Basic', 'Advanced', 'Expert', 'Master', 'Re:Master']
+         'Basic', 'Advanced', 'Expert', 'Master', 'Re:Master',
+         'ap', 'ap+', '理论', 'fc', 'fc+', 'fcp', '全连']
     ),
     key=len, reverse=True
 )
@@ -772,6 +907,7 @@ def _classify_compact_tokens(tokens: list[str], all_genres: list[str]) -> dict:
         "genre": "", "version": "", "song_type": "",
         "level_label": "", "level_value": "",
         "ds_value": 0.0, "charter": "", "is_new": None,
+        "fc_status": "",
     }
 
     for token in tokens:
@@ -796,6 +932,17 @@ def _classify_compact_tokens(tokens: list[str], all_genres: list[str]) -> dict:
         # 新歌
         if kw in ("新歌", "新曲"):
             criteria["is_new"] = True; continue
+
+        # FC/AP 状态
+        # fc/全连 → fc+以上; fc+ → fcp+以上; ap → ap+以上; ap+/理论 → app 仅
+        if kw_lower in ("fc", "全连"):
+            criteria["fc_status"] = "fc"; continue
+        if kw_lower in ("fc+", "fcp"):
+            criteria["fc_status"] = "fc+"; continue
+        if kw_lower == "ap":
+            criteria["fc_status"] = "ap"; continue
+        if kw_lower in ("ap+", "app", "理论"):
+            criteria["fc_status"] = "ap+"; continue
 
         # 等级值 (13/14+/15)
         if re.match(r'^\d{1,2}\+?$', kw):
@@ -867,6 +1014,7 @@ def _detect_compact_filter(text: str) -> bool:
         elif t in VERSION_CODES: cats.add('version')
         elif tl in ('dx', 'sd', '标准', '旧框'): cats.add('type')
         elif t in ('新歌', '新曲'): cats.add('new')
+        elif tl in ('fc', 'fc+', 'fcp', '全连', 'ap', 'ap+', 'app', '理论'): cats.add('fc')
         elif re.match(r'^\d{1,2}\+?$', t) or re.match(r'^\d{1,2}\.\d$', t):
             cats.add('level')
     if len(cats) >= 2:
@@ -994,6 +1142,13 @@ async def _handle_score_list(event: MessageEvent, criteria: dict, page: int):
                     continue
         if criteria["is_new"] and song and not song.is_new:
             continue
+        # FC/AP 筛选
+        fc_status = criteria.get("fc_status", "")
+        if fc_status:
+            if fc_status == "ap+" and rec.fc != "app": continue
+            if fc_status == "ap" and rec.fc not in ("ap", "app"): continue
+            if fc_status == "fc+" and rec.fc not in ("fcp", "ap", "app"): continue
+            if fc_status == "fc" and rec.fc not in ("fc", "fcp", "ap", "app"): continue
         filtered.append(rec)
 
     if not filtered:
@@ -1106,6 +1261,13 @@ async def handle_compact_filter(event: MessageEvent):
                         continue
             if criteria["is_new"] and song and not song.is_new:
                 continue
+            # FC/AP 筛选
+            fc_status = criteria.get("fc_status", "")
+            if fc_status:
+                if fc_status == "ap+" and rec.fc != "app": continue
+                if fc_status == "ap" and rec.fc not in ("ap", "app"): continue
+                if fc_status == "fc+" and rec.fc not in ("fcp", "ap", "app"): continue
+                if fc_status == "fc" and rec.fc not in ("fc", "fcp", "ap", "app"): continue
             filtered.append(rec)
 
         if not filtered:

@@ -1163,3 +1163,290 @@ class ImportDiffRenderer:
             + datetime.now().strftime("%Y-%m-%d %H:%M"),
             fill=TEXT_MUTED, font=_font(10),
         )
+
+
+# ══════════════════════════════════════════════════════════════
+# 练习推荐渲染器 — 5×10 卡片网格，沿用 B50 卡片样式
+# ══════════════════════════════════════════════════════════════
+
+# difficulty 字符串 → level_index
+_DIFF_TO_IDX = {
+    "basic": 0, "advanced": 1, "expert": 2,
+    "master": 3, "remaster": 4,
+}
+
+# difficulty 字符串 → 短标签
+_DIFF_SHORT = {
+    "basic": "BAS", "advanced": "ADV", "expert": "EXP",
+    "master": "MAS", "remaster": "ReM",
+}
+
+REC_HEADER_H = 120
+
+
+def _draw_recommendation_card(
+    img: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    thumbs: dict[str, Image.Image],
+    cx: int, cy: int,
+    rec,  # PracticeRecommendation
+    target_tag: str,
+) -> None:
+    """绘制一张练习推荐卡片（400×160）"""
+    level_idx = _DIFF_TO_IDX.get(rec.sheet_difficulty, 3)
+    tc = _card_text_color(level_idx)
+
+    # 1. 卡片背景
+    card_name = DIFF_CARD.get(level_idx, "card_mas")
+    card_img = _get_asset(card_name)
+    if card_img:
+        img.paste(card_img, (cx, cy), card_img)
+
+    # 2. 封面
+    thumb = thumbs.get(rec.song_id)
+    if thumb:
+        scaled = thumb.resize((COVER_SIZE, COVER_SIZE), Image.LANCZOS)
+        img.paste(scaled, (cx + COVER_X, cy + COVER_Y), scaled)
+
+    # 3. 曲名
+    title_font = _font(14)
+    draw.text(
+        (cx + TITLE_X, cy + TITLE_Y),
+        _truncate(rec.title, title_font, TITLE_W),
+        fill=tc, font=title_font, stroke_width=1,
+    )
+
+    # 4. 类型 + 难度 + 定数
+    type_icon_name = TYPE_ICON.get(rec.sheet_type)
+    info_y = cy + 33
+    icon_x = cx + TITLE_X
+    if type_icon_name:
+        type_icon = _get_asset(type_icon_name)
+        if type_icon:
+            type_icon = _scale_to_h(type_icon, 14)
+            img.paste(type_icon, (icon_x, info_y + 3), type_icon)
+            icon_x += type_icon.width + 6
+
+    diff_short = _DIFF_SHORT.get(rec.sheet_difficulty, rec.sheet_difficulty.upper()[:3])
+    info_text = f"{diff_short}  ·  定数 {rec.ds:.1f}"
+    info_font = _font(15, bold=True)
+    draw.text(
+        (icon_x, info_y), info_text,
+        fill=tc, font=info_font, stroke_width=1,
+    )
+
+    # 5. 标签（目标 tag 加粗橙色高亮，其他浅白清晰可辨）
+    tag_y = cy + 58
+    tag_x = cx + TITLE_X
+    tag_font = _font(13)
+    tag_font_bold = _font(13, bold=True)
+    tag_max_w = TITLE_W + 55
+    tag_line_h = 20
+
+    # 目标标签排前面
+    sorted_tags = sorted(rec.all_tags, key=lambda t: (t != target_tag, t))
+    lines: list[list[tuple[str, bool]]] = []  # [[(tag_name, is_target), ...], ...]
+    current_line: list[tuple[str, bool]] = []
+    current_w = 0
+    sep_w = tag_font.getlength("  ")
+    for t in sorted_tags:
+        tag_text = f"#{t}"
+        tw = tag_font_bold.getlength(tag_text) if t == target_tag else tag_font.getlength(tag_text)
+        if current_line:
+            test_w = current_w + sep_w + tw
+            if test_w > tag_max_w:
+                lines.append(current_line)
+                current_line = []
+                current_w = 0
+        current_line.append((t, t == target_tag))
+        current_w += (sep_w if len(current_line) > 1 else 0) + tw
+
+    if current_line:
+        lines.append(current_line)
+
+    for li, line_tags in enumerate(lines):
+        seg_x = tag_x
+        for pi, (t, is_target) in enumerate(line_tags):
+            if pi > 0:
+                draw.text(
+                    (seg_x, tag_y + li * tag_line_h), "  ",
+                    fill=TEXT_MUTED, font=tag_font, stroke_width=1,
+                )
+                seg_x += int(tag_font.getlength("  "))
+            tag_text = f"#{t}"
+            if is_target:
+                color = ACCENT
+                font = tag_font_bold
+            else:
+                color = (210, 215, 225)
+                font = tag_font
+            draw.text(
+                (seg_x, tag_y + li * tag_line_h), tag_text,
+                fill=color, font=font, stroke_width=1,
+            )
+            seg_x += int(font.getlength(tag_text))
+
+    # 6. 游玩状态
+    status_y = cy + 118
+    if rec.played:
+        ach_color = _rate_color_for_achievement(rec.current_achievement)
+        status_text = f"✓ {rec.current_achievement:.1f}%"
+        status_font = _font(12)
+        draw.text(
+            (cx + TITLE_X, status_y), status_text,
+            fill=ach_color, font=status_font, stroke_width=1,
+        )
+    else:
+        status_text = "未游玩"
+        status_font = _font(12)
+        draw.text(
+            (cx + TITLE_X, status_y), status_text,
+            fill=TEXT_DIM, font=status_font, stroke_width=1,
+        )
+
+    # 7. 歌曲 ID
+    draw.text(
+        (cx + ID_X, cy + ID_Y),
+        f"ID {rec.song_id}", fill=WHITE, font=_font(13), stroke_width=1,
+    )
+
+
+def _rate_color_for_achievement(ach: float) -> tuple[int, int, int]:
+    """达成率颜色：SSS+(金) ≥100.5 / SS+(红) ≥99.0 / S+(橙) ≥97.0 / 其它灰"""
+    if ach >= 100.5:
+        return (230, 60, 130)   # SSS+ gold-pink
+    elif ach >= 99.0:
+        return (220, 80, 80)    # SS+ red
+    elif ach >= 97.0:
+        return (210, 140, 30)   # S+ orange
+    else:
+        return TEXT_MUTED
+
+
+class RecommendationRenderer:
+    """练习推荐图片渲染器 — 5 列 × 10 行 卡片网格"""
+
+    def __init__(
+        self,
+        recommendations: list,     # list[PracticeRecommendation]
+        username: str,
+        tag_name: str,
+        covers: dict[str, bytes] | None = None,
+        floor_ra: float = 0,
+        ceiling_ra: float = 0,
+        avg_ra: float = 0,
+        floor_ds: float = 0,
+        ceiling_ds: float = 0,
+        center_ds: float = 0,
+        total_tagged: int = 0,
+    ):
+        self.recs = recommendations[:50]
+        self.username = username
+        self.tag_name = tag_name
+        self.floor_ra = floor_ra
+        self.ceiling_ra = ceiling_ra
+        self.avg_ra = avg_ra
+        self.floor_ds = floor_ds
+        self.ceiling_ds = ceiling_ds
+        self.center_ds = center_ds
+        self.total_tagged = total_tagged
+
+        # 预加载封面
+        self._thumbs: dict[str, Image.Image] = {}
+        if covers:
+            for sid, data in covers.items():
+                if data and len(data) > 1000:
+                    try:
+                        thumb = Image.open(io.BytesIO(data)).convert("RGBA")
+                        thumb = _fill_crop(thumb, COVER_SIZE, COVER_SIZE)
+                        thumb = _round_mask(thumb, 6)
+                        self._thumbs[sid] = thumb
+                    except Exception:
+                        pass
+            # 缺封面的用占位图
+            for rec in self.recs:
+                if rec.song_id not in self._thumbs:
+                    self._thumbs[rec.song_id] = _get_placeholder_cover()
+
+        rows = (len(self.recs) + COLS - 1) // COLS
+        self.height = REC_HEADER_H + rows * (CARD_H + ROW_GAP) - ROW_GAP + FOOTER_H
+
+        # 背景
+        bg = _load_asset("orangestar")
+        if bg:
+            bg = _fill_crop(bg, WIDTH, self.height)
+            self.img = bg.convert("RGB")
+        else:
+            self.img = Image.new("RGB", (WIDTH, self.height), SKY_BLUE)
+        self.draw = ImageDraw.Draw(self.img)
+
+    def render(self) -> Image.Image:
+        y = self._draw_header(0)
+        y = self._draw_grid(y)
+        self._draw_footer(y)
+        return self.img
+
+    def to_bytes(self) -> bytes:
+        buf = io.BytesIO()
+        self.img.save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+
+    def _draw_header(self, y: int) -> int:
+        """绘制头部：标签名 + 玩家名 + RA 统计 + SSS+ 对应定数"""
+        # 标题
+        self.draw.text(
+            (MARGIN, y + 30),
+            f"练 {self.tag_name} 练习推荐",
+            fill=TEXT, font=_font(36, bold=True), stroke_width=1,
+        )
+        # 玩家名
+        self.draw.text(
+            (MARGIN, y + 72),
+            f"玩家: {self.username}",
+            fill=TEXT_DIM, font=_font(18), stroke_width=1,
+        )
+        # RA 地板/天花板/均分 → SSS+ 对应定数
+        ra_text = (
+            f"B50 RA: {self.floor_ra:.0f}(底) ~ {self.ceiling_ra:.0f}(顶)"
+            f"  |  均 {self.avg_ra:.0f}"
+            f"  |  SSS+对应: {self.floor_ds:.1f} ~ {self.ceiling_ds:.1f}"
+            f"  |  推荐中心 {self.center_ds:.1f}"
+        )
+        self.draw.text(
+            (MARGIN, y + 94),
+            ra_text,
+            fill=TEXT_DIM, font=_font(14), stroke_width=1,
+        )
+        # 统计（右侧）
+        stat_text = f"共 {self.total_tagged} 首带此标签  ·  推荐 {len(self.recs)} 首"
+        self.draw.text(
+            (WIDTH - MARGIN - int(_font(14).getlength(stat_text)), y + 94),
+            stat_text,
+            fill=TEXT_MUTED, font=_font(14), stroke_width=1,
+        )
+        return y + REC_HEADER_H
+
+    def _draw_grid(self, y: int) -> int:
+        rows = (len(self.recs) + COLS - 1) // COLS
+        for row in range(rows):
+            row_y = y + row * (CARD_H + ROW_GAP)
+            for col in range(COLS):
+                idx = row * COLS + col
+                if idx >= len(self.recs):
+                    break
+                _draw_recommendation_card(
+                    self.img, self.draw, self._thumbs,
+                    MARGIN + col * (CARD_W + CARD_GAP),
+                    row_y,
+                    self.recs[idx],
+                    self.tag_name,
+                )
+        return y + rows * CARD_H + (rows - 1) * ROW_GAP
+
+    def _draw_footer(self, y: int) -> None:
+        self.draw.text(
+            (MARGIN, y + 16),
+            "kanobot  \xb7  数据来源 diving-fish / dxrating  \xb7  "
+            + datetime.now().strftime("%Y-%m-%d %H:%M"),
+            fill=TEXT_MUTED, font=_font(14), stroke_width=1,
+        )
