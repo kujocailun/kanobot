@@ -337,22 +337,31 @@ NOT_BOUND_MSG = (
 )
 
 NEED_TOKEN_MSG = (
-    "❌ 此功能需要 Import-Token！\n\n"
-    "QQ公查只能获取 B50（50条成绩），无法用于完整筛选。\n"
-    "请在私聊中使用: bind <用户名> <Import-Token>\n"
-    "获取: https://www.diving-fish.com/maimaidx/prober/ → 编辑个人资料 → 生成 Import-Token"
+    "❌ 未找到你关联的水鱼账号！\n\n"
+    "请去水鱼官网绑定 QQ 号：\n"
+    "  https://www.diving-fish.com/maimaidx/prober/ → 编辑个人资料 → 绑定QQ号\n\n"
+    "绑定后稍等片刻再试即可。"
 )
 
 
 async def resolve_username(event: MessageEvent) -> str:
-    """解析水鱼用户名：本地绑定 → QQ公查（需在水鱼绑定了QQ且隐私公开）"""
+    """解析水鱼用户名：本地绑定 → Dev-Token QQ查 → QQ公查"""
     t = get_token(str(event.user_id))
     if t:
         return t[0]
 
-    # 无本地绑定 → 尝试 QQ 公查
+    qq = str(event.user_id)
+    # Dev-Token：直接按 QQ 查完整成绩，拿到昵称
     try:
-        profile = await api.get_player_data(qq=str(event.user_id))
+        profile = await api.get_dev_player_records(qq=qq)
+        if profile and profile.nickname:
+            return profile.nickname
+    except Exception:
+        pass
+
+    # 无本地绑定 → 尝试 QQ 公查（仅 B50，受隐私设置影响）
+    try:
+        profile = await api.get_player_data(qq=qq)
         if profile and profile.nickname:
             return profile.nickname
     except Exception:
@@ -499,12 +508,11 @@ def _build_song_detail(song, records: list, username: str, has_token: bool = Fal
     elif username and has_token:
         lines.append(f"──── {username} 暂无此曲成绩 ────")
     elif username and not has_token:
-        lines.append("────\n⚠️ 个人成绩需要 Import-Token（QQ公查只能获取B50）")
-        lines.append("请私聊: bind <用户名> <Import-Token>")
+        lines.append("────\n⚠️ 未找到个人成绩。")
+        lines.append("请去水鱼官网绑定QQ号: https://www.diving-fish.com/maimaidx/prober/")
     else:
         lines.append("────\n⚠️ 无法获取个人成绩。")
-        lines.append("方式一: 在水鱼官网绑定QQ并设为公开")
-        lines.append("方式二: 私聊 bind <用户名> <Import-Token>")
+        lines.append("请去水鱼官网绑定QQ号: https://www.diving-fish.com/maimaidx/prober/")
     return "\n".join(lines)
 
 
@@ -915,14 +923,24 @@ async def _parse_compact(text: str) -> tuple[dict, str, int]:
 
 
 async def _fetch_player_full(qq: str):
-    """获取玩家完整数据 — 仅 Import-Token，无 token 返回 None"""
+    """获取玩家完整数据 — Dev-Token 优先，Import-Token 回落，无凭据返回 None"""
+    # 优先：Developer-Token（无需用户手动绑定 Import-Token）
+    full = await api.get_dev_player_records(qq=qq)
+    if full and full.records:
+        logger.info(f"[compact] Dev接口获取 {len(full.records)} 条成绩")
+        return full
+    if full is None and api._dev_token:
+        # Dev-Token 有效但用户不存在 → 区分「查无此人」和「无 token」
+        return None
+
+    # 回落：Import-Token（旧方式）
     t = get_token(qq)
     if not t:
         return None
     _, token = t
     full = await api.get_player_full_records(import_token=token)
     if full and full.records:
-        logger.info(f"[compact] 完整接口获取 {len(full.records)} 条成绩")
+        logger.info(f"[compact] Import-Token接口获取 {len(full.records)} 条成绩")
         return full
     return None
 

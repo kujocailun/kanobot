@@ -100,8 +100,9 @@ class MaimaiAPI:
     ALIAS_API = "https://www.yuzuchan.moe/api/maimaidx/maimaidxalias"
     ALIAS_CACHE = os.path.join(os.path.dirname(__file__), "cache", "music_alias.json")
 
-    def __init__(self):
+    def __init__(self, dev_token: str = ""):
         self._client: Optional[httpx.AsyncClient] = None
+        self._dev_token = dev_token or os.environ.get("DEVELOPER_TOKEN", "")
 
         # 歌曲库缓存
         self._song_map: dict[str, "SongInfo"] = {}
@@ -396,13 +397,93 @@ class MaimaiAPI:
             logger.info(f"[API] 完整成绩请求失败: {e}")
             return None
 
+    # ══════════════════════════════════════════════════
+    # 3.1.5-dev  完整成绩（Developer-Token）★ 推荐
+    # ══════════════════════════════════════════════════
+
+    async def get_dev_player_records(
+        self, *, username: str = "", qq: str = "",
+    ) -> Optional[PlayerProfile]:
+        """
+        GET /dev/player/records  用 Developer-Token 按 QQ/用户名查任意玩家成绩。
+        免去用户绑定 Import-Token，只需在水鱼绑定 QQ 即可。
+        返回 None 表示用户不存在（提示去绑定QQ）。
+        """
+        if not self._dev_token:
+            logger.info("[API] Developer-Token 未配置，回退到 Import-Token 模式")
+            return None
+        if not username and not qq:
+            raise ValueError("必须提供用户名或 QQ 号")
+
+        client = await self._get_client()
+        params = {}
+        if username:
+            params["username"] = username
+        else:
+            params["qq"] = qq
+
+        try:
+            resp = await client.get(
+                f"{self.BASE_URL}/dev/player/records",
+                headers={"Developer-Token": self._dev_token},
+                params=params,
+            )
+            if resp.status_code == 400:
+                logger.info(f"[API] 用户不存在(dev): {username or qq}")
+                return None
+            resp.raise_for_status()
+            return PlayerProfile.from_api(resp.json())
+        except httpx.HTTPError as e:
+            logger.info(f"[API] Dev 完整成绩请求失败: {e}")
+            return None
+
+    async def get_dev_player_record(
+        self, music_id, *, username: str = "", qq: str = "",
+    ) -> Optional[list]:
+        """
+        POST /dev/player/record  用 Developer-Token 查单曲成绩。
+        music_id 可为 int 或 list[int]。
+        返回该歌曲各难度成绩列表，用户不存在返回 None。
+        """
+        if not self._dev_token:
+            return None
+        if not username and not qq:
+            raise ValueError("必须提供用户名或 QQ 号")
+
+        client = await self._get_client()
+        payload: dict = {"music_id": music_id}
+        if username:
+            payload["username"] = username
+        else:
+            payload["qq"] = qq
+
+        try:
+            resp = await client.post(
+                f"{self.BASE_URL}/dev/player/record",
+                headers={"Developer-Token": self._dev_token},
+                json=payload,
+            )
+            if resp.status_code == 400:
+                logger.info(f"[API] 用户不存在(dev record): {username or qq}")
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list):
+                from models import ScoreRecord
+                return [ScoreRecord.from_api(r) for r in data if isinstance(r, dict)]
+            return []
+        except httpx.HTTPError as e:
+            logger.info(f"[API] Dev 单曲成绩请求失败: {e}")
+            return None
+
     async def get_song_player_record(
         self, song_id: str, *, username: str = "", qq: str = "",
         password: str = "", import_token: str = "",
     ) -> tuple[Optional[SongInfo], list[ScoreRecord]]:
         """
         查询某玩家在指定歌曲上的成绩。
-        - 有 password/import_token → 调 /player/records 拿完整成绩后过滤（最全）
+        - 有 Dev-Token → 调 /dev/player/record（推荐，全覆盖）
+        - 有 password/import_token → 调 /player/records 过滤（旧方式）
         - 无凭据 → B50 + 全版本 plate 兜底（公开接口，覆盖面有限）
         返回 (song, records)
         """
@@ -417,7 +498,18 @@ class MaimaiAPI:
         seen_levels: set[int] = set()
         matched: list[ScoreRecord] = []
 
-        # ── 有凭据：拿完整成绩（全覆盖，无遗漏）──
+        # ── Dev-Token 优先：直接查单曲（最快、最全）──
+        if self._dev_token and (username or qq):
+            records = await self.get_dev_player_record(
+                target_id, username=username, qq=qq,
+            )
+            if records:
+                return song, records
+            # 返回 None（非空 list）表示用户不存在
+            if records is None:
+                return song, []
+
+        # ── 有凭据：拿完整成绩后过滤（全覆盖，无遗漏）──
         if username and (password or import_token):
             profile = None
             if import_token:

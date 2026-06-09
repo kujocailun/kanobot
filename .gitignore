@@ -1,6 +1,8 @@
 # Secrets
 .env
 server.conf
+restart.sh
+deploy.bat
 
 # Python
 __pycache__/
