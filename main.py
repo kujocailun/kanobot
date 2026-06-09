@@ -58,6 +58,9 @@ async def kano_prefix(event: Event):
     # 群聊 @bot 优先处理 — 即使无文本也要响应
     if isinstance(event, GroupMessageEvent):
         if event.is_tome():
+            # 回复 bot 的消息不视为 @bot 调用（裸回复复读不算命令）
+            if getattr(event, 'reply', None) is not None:
+                return
             # 移除 @bot 的 at 段
             remaining = [seg for seg in event.message if seg.type != 'at']
             at_text = Message(remaining).extract_plain_text().strip()
@@ -219,12 +222,15 @@ async def log_all_messages(bot: Bot, event: Event):
 # 不同文本打断即全重置，同一条消息可在新序列中再次复读
 _repeat_tracker: dict[str, dict] = {}
 
-# 不参与复读的消息段类型（图片/语音/视频/拍一拍不计数）
-_SKIP_REPEAT_SEG_TYPES = {"image", "record", "video", "poke"}
+# 不参与复读的消息段类型（图片/语音/视频/拍一拍/回复不计数）
+_SKIP_REPEAT_SEG_TYPES = {"image", "record", "video", "poke", "reply"}
 
 
 def _should_count_repeat(event: MessageEvent) -> bool:
     """判断消息是否应纳入复读计数"""
+    # 回复消息不参与复读（引用文本会污染计数）
+    if getattr(event, 'reply', None) is not None:
+        return False
     text = event.get_plaintext().strip()
     if not text or len(text) < 2:
         return False
@@ -242,6 +248,10 @@ async def handle_repeat(bot: Bot, event: GroupMessageEvent):
     if not isinstance(event, GroupMessageEvent):
         return
     if not _should_count_repeat(event):
+        # 不可计数的消息（图片/回复/语音等）→ 中断复读链，重置计数
+        group_id = str(event.group_id)
+        if _repeat_tracker.get(group_id):
+            del _repeat_tracker[group_id]
         return
 
     text = event.get_plaintext().strip()
@@ -1066,6 +1076,7 @@ async def handle_compact_filter(event: MessageEvent):
                 if chart:
                     kw_src = criteria["charter"].lower()
                     kw_vars = {kw_src, normalize_cjk(kw_src, "traditional"), normalize_cjk(kw_src, "simplified")}
+                    kw_vars.update(expand_charter_kw(kw_src))
                     matched = False
                     if chart.charter and any(k in chart.charter.lower() for k in kw_vars):
                         matched = True
